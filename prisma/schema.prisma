@@ -1,0 +1,601 @@
+// StoreIQ Simple Virtual Shield — data model.
+//
+// Tenant isolation: every table carrying "tenantId" (except Membership and
+// JobQueue, which are needed before a tenant context exists) is protected by a
+// PostgreSQL row-level-security policy keyed on the transaction-local setting
+// `app.tenant_id`. See prisma/migrations/*_row_level_security and
+// docs/security-and-tenant-isolation.md.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum Role {
+  ADMIN
+  MANAGER
+  OPERATOR
+  VIEWER
+}
+
+enum ZoneType {
+  SALES_FLOOR
+  BACK_ROOM
+  RECEIVING
+  DISPATCH
+  FITTING_ROOM
+  OTHER
+}
+
+enum ZoneRelation {
+  ADJACENT
+  DOORWAY
+  SHARED_WALL
+  SEPARATED
+}
+
+enum UploadStatus {
+  RECEIVED
+  REJECTED
+  FILE_DELETED
+}
+
+enum JobStatus {
+  QUEUED
+  PARSING
+  CLASSIFYING
+  EXPORTING
+  COMPLETED
+  FAILED
+}
+
+enum QueueStatus {
+  PENDING
+  RUNNING
+  DONE
+  FAILED
+}
+
+enum Classification {
+  ACCEPTED
+  NEEDS_REVIEW
+  REJECTED_FROM_ZONE
+}
+
+enum DatasetPurpose {
+  CALIBRATION
+  GROUND_TRUTH
+}
+
+enum LabelCategory {
+  KNOWN_LOCATION
+  BOUNDARY
+  CROSS_READ_EXAMPLE
+  AMBIGUOUS
+}
+
+model Tenant {
+  id        String   @id @default(uuid())
+  name      String
+  slug      String   @unique
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  memberships Membership[]
+  stores      Store[]
+}
+
+model User {
+  id                 String    @id @default(uuid())
+  email              String    @unique
+  name               String
+  passwordHash       String
+  mustChangePassword Boolean   @default(false)
+  disabledAt         DateTime?
+  lastLoginAt        DateTime?
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
+
+  memberships Membership[]
+  sessions    Session[]
+}
+
+model Membership {
+  id        String   @id @default(uuid())
+  tenantId  String
+  userId    String
+  role      Role
+  createdAt DateTime @default(now())
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, userId])
+  @@index([userId])
+}
+
+/// Server-side session. `id` is the SHA-256 hash of the cookie token; the raw
+/// token is never stored.
+model Session {
+  id             String   @id
+  userId         String
+  activeTenantId String?
+  expiresAt      DateTime
+  createdAt      DateTime @default(now())
+  lastSeenAt     DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+model Store {
+  id        String   @id @default(uuid())
+  tenantId  String
+  name      String
+  code      String
+  timeZone  String   @default("UTC")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tenant        Tenant               @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  zones         Zone[]
+  uploads       Upload[]
+  jobs          ProcessingJob[]
+  anchors       AnchorTag[]
+  datasets      CalibrationDataset[]
+  relationships ZoneRelationship[]
+
+  @@unique([tenantId, code])
+  @@unique([id, tenantId])
+  @@index([tenantId])
+}
+
+model Zone {
+  id        String   @id @default(uuid())
+  tenantId  String
+  storeId   String
+  code      String
+  name      String
+  type      ZoneType
+  /// Alternative labels used in scan exports (e.g. "SF", "Floor").
+  aliases   String[]
+  sortOrder Int      @default(0)
+  active    Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  store   Store              @relation(fields: [storeId, tenantId], references: [id, tenantId], onDelete: Cascade)
+  anchors AnchorTag[]
+  labels  GroundTruthLabel[]
+  relFrom ZoneRelationship[] @relation("relFrom")
+  relTo   ZoneRelationship[] @relation("relTo")
+
+  @@unique([storeId, code])
+  @@unique([id, tenantId])
+  @@index([tenantId, storeId])
+}
+
+model ZoneRelationship {
+  id         String       @id @default(uuid())
+  tenantId   String
+  storeId    String
+  fromZoneId String
+  toZoneId   String
+  relation   ZoneRelation
+  notes      String?
+  createdAt  DateTime     @default(now())
+
+  store    Store @relation(fields: [storeId, tenantId], references: [id, tenantId], onDelete: Cascade)
+  fromZone Zone  @relation("relFrom", fields: [fromZoneId, tenantId], references: [id, tenantId], onDelete: Cascade)
+  toZone   Zone  @relation("relTo", fields: [toZoneId, tenantId], references: [id, tenantId], onDelete: Cascade)
+
+  @@unique([storeId, fromZoneId, toZoneId])
+  @@index([tenantId, storeId])
+}
+
+model Upload {
+  id               String       @id @default(uuid())
+  tenantId         String
+  storeId          String
+  originalFilename String
+  storageKey       String
+  sizeBytes        Int
+  sha256           String
+  encoding         String
+  hasBom           Boolean
+  delimiter        String
+  lineEnding       String
+  status           UploadStatus @default(RECEIVED)
+  /// Pattern A: the whole file belongs to this zone. Null for combined files.
+  zoneId           String?
+  /// User-supplied scan session label (defaults to file name).
+  sessionLabel     String?
+  uploadedById     String
+  createdAt        DateTime     @default(now())
+  fileDeletedAt    DateTime?
+
+  store     Store       @relation(fields: [storeId, tenantId], references: [id, tenantId], onDelete: Cascade)
+  jobInputs JobUpload[]
+
+  @@unique([id, tenantId])
+  @@index([tenantId, storeId, createdAt])
+  @@index([tenantId, storeId, sha256])
+}
+
+model ColumnMappingProfile {
+  id           String   @id @default(uuid())
+  tenantId     String
+  storeId      String?
+  name         String
+  /// Free-text label for the export format (e.g. "RFD40 Inventory app v2").
+  exportFormat String?
+  /// { epc: "Tag ID", zone: "Location", ... }
+  mapping      Json
+  /// { "SF": "<zoneId>", ... }
+  zoneValueMap Json     @default("{}")
+  dateFormat   String   @default("AUTO")
+  createdById  String
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@unique([tenantId, name])
+  @@index([tenantId, storeId])
+}
+
+/// Immutable, versioned processing configuration. Editing creates a new row
+/// with version + 1 so every job remains reproducible.
+model ProcessingProfile {
+  id              String   @id @default(uuid())
+  tenantId        String
+  storeId         String?
+  name            String
+  version         Int
+  config          Json
+  rulesVersion    String
+  isDefault       Boolean  @default(false)
+  notes           String?
+  /// Jobs whose calibration labels informed this version (leakage guard).
+  tunedFromJobIds String[]
+  createdById     String?
+  createdAt       DateTime @default(now())
+
+  jobs ProcessingJob[]
+
+  @@unique([tenantId, name, version])
+  @@unique([id, tenantId])
+  @@index([tenantId, storeId])
+}
+
+model ProcessingJob {
+  id                  String    @id @default(uuid())
+  tenantId            String
+  storeId             String
+  status              JobStatus @default(QUEUED)
+  idempotencyKey      String?
+  inputHash           String
+  processingProfileId String
+  attempt             Int       @default(0)
+  progress            Int       @default(0)
+  stage               String?
+  inputRowCount       Int       @default(0)
+  rowsProcessed       Int       @default(0)
+  uniqueEpcCount      Int       @default(0)
+  errorMessage        String?
+  warnings            Json      @default("[]")
+  createdById         String
+  createdAt           DateTime  @default(now())
+  startedAt           DateTime?
+  completedAt         DateTime?
+  updatedAt           DateTime  @updatedAt
+
+  store       Store                  @relation(fields: [storeId, tenantId], references: [id, tenantId], onDelete: Cascade)
+  profile     ProcessingProfile      @relation(fields: [processingProfileId, tenantId], references: [id, tenantId])
+  inputs      JobUpload[]
+  sessions    ScanSession[]
+  rawObs      RawObservation[]
+  rowErrors   RowError[]
+  summaries   EpcZoneSummary[]
+  results     ClassificationResult[]
+  outputs     JobOutput[]
+  metrics     ProcessingMetrics?
+  evaluations Evaluation[]
+
+  @@unique([id, tenantId])
+  @@unique([tenantId, idempotencyKey])
+  @@index([tenantId, storeId, createdAt])
+  @@index([tenantId, status])
+  @@index([tenantId, inputHash])
+}
+
+/// Upload used by a job, with the column mapping snapshot that was applied.
+model JobUpload {
+  jobId    String
+  uploadId String
+  tenantId String
+  mapping  Json
+
+  job    ProcessingJob @relation(fields: [jobId, tenantId], references: [id, tenantId], onDelete: Cascade)
+  upload Upload        @relation(fields: [uploadId, tenantId], references: [id, tenantId], onDelete: Cascade)
+
+  @@id([jobId, uploadId])
+  @@index([tenantId])
+}
+
+model ScanSession {
+  id               String    @id @default(uuid())
+  tenantId         String
+  storeId          String
+  jobId            String
+  uploadId         String
+  externalId       String
+  zoneId           String?
+  startedAt        DateTime?
+  endedAt          DateTime?
+  observationCount Int
+  uniqueEpcCount   Int
+
+  job ProcessingJob @relation(fields: [jobId, tenantId], references: [id, tenantId], onDelete: Cascade)
+
+  @@unique([jobId, uploadId, externalId])
+  @@index([tenantId, jobId])
+}
+
+/// Traceable source record for each valid input row.
+model RawObservation {
+  id         BigInt    @id @default(autoincrement())
+  tenantId   String
+  jobId      String
+  uploadId   String
+  rowNumber  Int
+  epcRaw     String
+  epc        String
+  zoneId     String
+  sessionKey String
+  observedAt DateTime?
+  rssi       Float?
+  readCount  Int?
+  phase      Float?
+  readerId   String?
+  antennaId  String?
+  isAnchor   Boolean   @default(false)
+  duplicate  Boolean   @default(false)
+
+  job ProcessingJob @relation(fields: [jobId, tenantId], references: [id, tenantId], onDelete: Cascade)
+
+  @@index([tenantId, jobId, epc])
+}
+
+/// Rows excluded at validation time (capped sample per job).
+model RowError {
+  id        BigInt  @id @default(autoincrement())
+  tenantId  String
+  jobId     String
+  uploadId  String
+  rowNumber Int
+  code      String
+  message   String
+  field     String?
+
+  job ProcessingJob @relation(fields: [jobId, tenantId], references: [id, tenantId], onDelete: Cascade)
+
+  @@index([tenantId, jobId])
+}
+
+model EpcZoneSummary {
+  id                String    @id @default(uuid())
+  tenantId          String
+  jobId             String
+  epc               String
+  zoneId            String
+  rowCount          Int
+  rawReadCount      Int
+  readCountComplete Boolean
+  windowCount       Int?
+  sessionCount      Int
+  firstSeen         DateTime?
+  lastSeen          DateTime?
+  medianRssi        Float?
+  p25Rssi           Float?
+  p75Rssi           Float?
+  rssiCount         Int
+  readerIds         String[]
+  antennaIds        String[]
+  sessionKeys       String[]
+  phaseAvailable    Boolean
+  dataQualityStatus String
+
+  job ProcessingJob @relation(fields: [jobId, tenantId], references: [id, tenantId], onDelete: Cascade)
+
+  @@unique([jobId, epc, zoneId])
+  @@index([tenantId, jobId, zoneId])
+}
+
+model ClassificationResult {
+  id                   String         @id @default(uuid())
+  tenantId             String
+  jobId                String
+  epc                  String
+  epcRaw               String
+  observedZoneIds      String[]
+  classification       Classification
+  assignedZoneId       String?
+  confidenceScore      Float?
+  confidenceType       String
+  confidenceBand       String?
+  reasonCode           String
+  reasonDescription    String
+  recommendedAction    String
+  evidenceAvailable    String[]
+  rulesFired           String[]
+  requiresManualReview Boolean
+  /// [{ zoneId, disposition, reasonCode }]
+  zoneDispositions     Json
+  evidence             Json
+
+  job ProcessingJob @relation(fields: [jobId, tenantId], references: [id, tenantId], onDelete: Cascade)
+
+  @@unique([jobId, epc])
+  @@index([tenantId, jobId, classification])
+  @@index([tenantId, jobId, assignedZoneId])
+  @@index([tenantId, epc])
+}
+
+model JobOutput {
+  id            String   @id @default(uuid())
+  tenantId      String
+  jobId         String
+  kind          String
+  filename      String
+  storageKey    String
+  sizeBytes     Int
+  sha256        String
+  rowCount      Int
+  schemaVersion String
+  createdAt     DateTime @default(now())
+
+  job ProcessingJob @relation(fields: [jobId, tenantId], references: [id, tenantId], onDelete: Cascade)
+
+  @@unique([jobId, kind])
+  @@index([tenantId, jobId])
+}
+
+model ProcessingMetrics {
+  id       String @id @default(uuid())
+  tenantId String
+  jobId    String
+  summary  Json
+
+  createdAt DateTime @default(now())
+
+  job ProcessingJob @relation(fields: [jobId, tenantId], references: [id, tenantId], onDelete: Cascade)
+
+  @@unique([jobId])
+  @@unique([jobId, tenantId])
+  @@index([tenantId])
+}
+
+model AnchorTag {
+  id            String    @id @default(uuid())
+  tenantId      String
+  storeId       String
+  zoneId        String
+  epc           String
+  description   String?
+  active        Boolean   @default(true)
+  registeredAt  DateTime  @default(now())
+  deactivatedAt DateTime?
+
+  store Store @relation(fields: [storeId, tenantId], references: [id, tenantId], onDelete: Cascade)
+  zone  Zone  @relation(fields: [zoneId, tenantId], references: [id, tenantId], onDelete: Cascade)
+
+  @@unique([storeId, epc])
+  @@index([tenantId, storeId])
+}
+
+model CalibrationDataset {
+  id          String         @id @default(uuid())
+  tenantId    String
+  storeId     String
+  name        String
+  purpose     DatasetPurpose
+  /// Optional scan job the labels describe (same collection period).
+  jobId       String?
+  notes       String?
+  labelCount  Int            @default(0)
+  createdById String
+  createdAt   DateTime       @default(now())
+
+  store       Store              @relation(fields: [storeId, tenantId], references: [id, tenantId], onDelete: Cascade)
+  labels      GroundTruthLabel[]
+  evaluations Evaluation[]
+
+  @@unique([id, tenantId])
+  @@index([tenantId, storeId])
+}
+
+model GroundTruthLabel {
+  id           String        @id @default(uuid())
+  tenantId     String
+  datasetId    String
+  epc          String
+  actualZoneId String
+  category     LabelCategory @default(KNOWN_LOCATION)
+  notes        String?
+
+  dataset    CalibrationDataset @relation(fields: [datasetId, tenantId], references: [id, tenantId], onDelete: Cascade)
+  actualZone Zone               @relation(fields: [actualZoneId, tenantId], references: [id, tenantId], onDelete: Cascade)
+
+  @@unique([datasetId, epc])
+  @@index([tenantId])
+}
+
+model Evaluation {
+  id          String   @id @default(uuid())
+  tenantId    String
+  jobId       String
+  datasetId   String
+  inSample    Boolean
+  metrics     Json
+  createdById String
+  createdAt   DateTime @default(now())
+
+  job     ProcessingJob      @relation(fields: [jobId, tenantId], references: [id, tenantId], onDelete: Cascade)
+  dataset CalibrationDataset @relation(fields: [datasetId, tenantId], references: [id, tenantId], onDelete: Cascade)
+
+  @@index([tenantId, jobId])
+}
+
+/// Append-only (UPDATE/DELETE revoked from the application role).
+model AuditEvent {
+  id          BigInt   @id @default(autoincrement())
+  tenantId    String
+  actorUserId String?
+  action      String
+  targetType  String?
+  targetId    String?
+  metadata    Json     @default("{}")
+  ip          String?
+  requestId   String?
+  createdAt   DateTime @default(now())
+
+  @@index([tenantId, createdAt])
+  @@index([tenantId, action])
+}
+
+/// Work queue. Not tenant-scoped by RLS because the worker must discover work
+/// before it knows the tenant; it stores identifiers only, and the worker
+/// re-validates ownership inside a tenant-scoped transaction.
+model JobQueue {
+  id          String      @id @default(uuid())
+  jobId       String      @unique
+  tenantId    String
+  status      QueueStatus @default(PENDING)
+  attempts    Int         @default(0)
+  maxAttempts Int         @default(3)
+  runAfter    DateTime    @default(now())
+  lockedAt    DateTime?
+  lockedBy    String?
+  lastError   String?
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @updatedAt
+
+  @@index([status, runAfter])
+}
+
+model WorkerHeartbeat {
+  workerId   String   @id
+  startedAt  DateTime @default(now())
+  lastBeatAt DateTime @default(now())
+}
+
+model RateLimitBucket {
+  key         String   @id
+  count       Int
+  windowStart DateTime
+}

@@ -1,0 +1,9 @@
+node_modules
+.next
+.data
+storage-data
+src/generated
+prisma/migrations
+tests/fixtures
+playwright-report
+test-results

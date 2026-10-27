@@ -1,0 +1,49 @@
+# Local/staging stack. Secrets come from .env (see .env.example); never commit them.
+# NOTE: authored but not executed in the original build environment (no Docker available).
+services:
+  db:
+    image: postgres:16.6-bookworm
+    environment:
+      POSTGRES_DB: vshield
+      POSTGRES_USER: vshield_owner
+      POSTGRES_PASSWORD: ${POSTGRES_OWNER_PASSWORD:?set POSTGRES_OWNER_PASSWORD}
+    volumes: ["pgdata:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vshield_owner -d vshield"]
+      interval: 5s
+      retries: 20
+
+  migrate:
+    build: .
+    command: ["sh", "-c", "npx prisma migrate deploy && npx tsx scripts/setup-db-roles.ts"]
+    environment:
+      MIGRATION_DATABASE_URL: postgresql://vshield_owner:${POSTGRES_OWNER_PASSWORD}@db:5432/vshield
+      APP_DB_PASSWORD: ${APP_DB_PASSWORD:?set APP_DB_PASSWORD}
+    depends_on:
+      db: { condition: service_healthy }
+
+  web:
+    build: .
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://vshield_app:${APP_DB_PASSWORD}@db:5432/vshield
+      LOCAL_STORAGE_DIR: /data/storage
+    ports: ["3000:3000"]
+    volumes: ["storage:/data/storage"]
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+
+  worker:
+    build: .
+    command: ["node", "node_modules/tsx/dist/cli.mjs", "src/worker/index.ts"]
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://vshield_app:${APP_DB_PASSWORD}@db:5432/vshield
+      LOCAL_STORAGE_DIR: /data/storage
+    volumes: ["storage:/data/storage"]
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+
+volumes:
+  pgdata:
+  storage:
